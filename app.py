@@ -8,6 +8,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 from pathlib import Path
+from urllib.parse import urlencode
 
 import geopandas as gpd
 import pandas as pd
@@ -103,6 +104,148 @@ _http = requests.Session()
 _http.mount("https://", HTTPAdapter(max_retries=_retry))
 
 
+class VWorldError(RuntimeError):
+    def __init__(self, message, code="", detail="", auth=False, transient=False):
+        super().__init__(message)
+        self.code = str(code or "")
+        self.detail = str(detail or "")
+        self.auth = auth
+        self.transient = transient
+
+
+def clean_api_text(text, limit=260):
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    text = re.sub(r"(?i)(key|serviceKey)=([^&\s]+)", r"\1=***", text)
+    if len(text) > limit:
+        return text[:limit].rstrip() + "..."
+    return text
+
+
+def json_from_response(resp):
+    try:
+        return resp.json()
+    except Exception:
+        text = resp.text or ""
+        m = re.match(r"^\s*[\w$.]+\((.*)\)\s*;?\s*$", text, flags=re.S)
+        if m:
+            return json.loads(m.group(1))
+        raise
+
+
+def is_vworld_auth_error(code, text):
+    if str(code) in {"401", "403"}:
+        return True
+
+    haystack = f"{code} {text}".lower()
+    return any(
+        token in haystack
+        for token in [
+            "invalid_key",
+            "invalid key",
+            "api key",
+            "apikey",
+            "servicekey",
+            "domain",
+            "인증",
+            "인증키",
+            "권한",
+            "등록되지",
+            "auth",
+            "unauthorized",
+            "forbidden",
+        ]
+    )
+
+
+def vworld_error_message(code, text):
+    detail = clean_api_text(" ".join(x for x in [code, text] if x))
+    if is_vworld_auth_error(code, text):
+        suffix = f" ({detail})" if detail else ""
+        return (
+            "VWorld API 인증 또는 도메인 설정을 확인해 주세요. "
+            "Streamlit Secrets의 VWORLD_API_KEY와 VWORLD_DOMAIN이 VWorld에 등록된 값과 맞아야 합니다."
+            f"{suffix}"
+        )
+    suffix = f": {detail}" if detail else ""
+    return f"VWorld 연속지적도 조회 중 오류가 발생했습니다{suffix}"
+
+
+def vworld_response_error(data):
+    if not isinstance(data, dict):
+        return "", ""
+
+    rsp = data.get("response")
+    if isinstance(rsp, dict) and rsp.get("status") == "ERROR":
+        err = rsp.get("error", {}) or {}
+        return str(err.get("code", "")), str(err.get("text", ""))
+
+    err = data.get("error") or data.get("errors")
+    if isinstance(err, dict):
+        return str(err.get("code", "")), str(err.get("text") or err.get("message") or "")
+    if isinstance(err, str):
+        return "", err
+
+    for key in ("ExceptionReport", "ServiceExceptionReport"):
+        if key in data:
+            return key, clean_api_text(data[key])
+
+    return "", ""
+
+
+def raise_for_vworld_response(data):
+    code, text = vworld_response_error(data)
+    if code or text:
+        raise VWorldError(
+            vworld_error_message(code, text),
+            code=code,
+            detail=text,
+            auth=is_vworld_auth_error(code, text),
+        )
+
+
+def vworld_json_get(url, params, timeout=45):
+    try:
+        resp = _http.get(url, params=params, timeout=timeout)
+    except requests.RequestException as e:
+        raise VWorldError(
+            "VWorld 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+            transient=True,
+        ) from e
+
+    body = clean_api_text(getattr(resp, "text", ""))
+    if resp.status_code >= 500:
+        raise VWorldError(
+            f"VWorld 서버가 일시적으로 응답하지 않습니다. (HTTP {resp.status_code})",
+            detail=body,
+            transient=True,
+        )
+    if resp.status_code >= 400:
+        raise VWorldError(
+            vworld_error_message(str(resp.status_code), body),
+            code=str(resp.status_code),
+            detail=body,
+            auth=is_vworld_auth_error(str(resp.status_code), body),
+        )
+
+    try:
+        data = json_from_response(resp)
+    except Exception as e:
+        raise VWorldError(
+            "VWorld 응답을 해석하지 못했습니다. API 키/도메인 설정 또는 VWorld 응답 형식을 확인해 주세요."
+            + (f" 응답: {body}" if body else ""),
+            detail=body,
+            auth=is_vworld_auth_error("", body),
+        ) from e
+
+    raise_for_vworld_response(data)
+    return data
+
+
+def vworld_proxy_json_get(url, params):
+    inner_url = url + "?" + urlencode(params)
+    return vworld_json_get("https://map.vworld.kr/proxy.do", {"url": inner_url})
+
+
 def money(v):
     v = float(v or 0)
     return f"{v/100_000_000:,.2f} 억원" if abs(v) >= 100_000_000 else f"{v:,.0f} 원"
@@ -153,9 +296,13 @@ def safe_json_get(url, params, timeout=45):
         raise RuntimeError(f"외부 API 요청이 거절되었습니다. (HTTP {r.status_code})")
 
     try:
-        return r.json()
+        return json_from_response(r)
     except Exception as e:
-        raise RuntimeError("외부 API 응답을 해석하지 못했습니다.") from e
+        body = clean_api_text(getattr(r, "text", ""))
+        raise RuntimeError(
+            "외부 API 응답을 해석하지 못했습니다."
+            + (f" 응답: {body}" if body else "")
+        ) from e
 
 
 def load_zone(uploaded, epsg):
@@ -237,13 +384,18 @@ def _data_api_features(data_id, box, key, domain):
     if domain:
         params["domain"] = domain
 
-    data = safe_json_get(VWORLD_DATA_URL, params)
+    try:
+        data = vworld_json_get(VWORLD_DATA_URL, params)
+    except VWorldError as e:
+        if e.transient:
+            try:
+                data = vworld_proxy_json_get(VWORLD_DATA_URL, params)
+            except VWorldError:
+                raise e
+        else:
+            raise
+
     rsp = data.get("response", {})
-    if rsp.get("status") == "ERROR":
-        e = rsp.get("error", {})
-        code = e.get("code", "")
-        text = e.get("text", "")
-        raise RuntimeError(f"VWorld 데이터 API 오류: {code} {text}".strip())
     if rsp.get("status") == "NOT_FOUND":
         return []
     return rsp.get("result", {}).get("featureCollection", {}).get("features", []) or []
@@ -258,13 +410,13 @@ def _wfs_features(box, key, domain):
         "SRSNAME": "EPSG:4326",
         "BBOX": f"{box[0]},{box[1]},{box[2]},{box[3]}",
         "MAXFEATURES": "1000",
-        "OUTPUT": "application/json",
+        "OUTPUT": "json",
         "KEY": key,
     }
     if domain:
         params["DOMAIN"] = domain
 
-    data = safe_json_get(VWORLD_WFS_URL, params)
+    data = vworld_json_get(VWORLD_WFS_URL, params)
     if isinstance(data, dict) and "features" in data:
         return data.get("features", []) or []
     rsp = data.get("response", {}) if isinstance(data, dict) else {}
@@ -279,18 +431,22 @@ def vworld_features(data_id, bounds, key, domain):
     for box in tile_bounds(bounds):
         try:
             part = _data_api_features(data_id, box, key, domain)
-        except RuntimeError as e:
+        except VWorldError as e:
+            if e.auth:
+                raise
             if data_id != "LP_PA_CBND_BUBUN":
                 raise
             try:
                 part = _wfs_features(box, key, domain)
                 fallback_used = True
-            except Exception:
+            except VWorldError as wfs_error:
+                if wfs_error.auth:
+                    raise
                 raise RuntimeError(
-                    "VWorld 연속지적도 서버가 현재 정상 응답하지 않습니다. "
-                    "좌표나 구역계 오류가 아니라 VWorld 공간데이터 조회 단계의 문제입니다. "
-                    "잠시 후 다시 산정해 주세요."
-                ) from e
+                    "VWorld 연속지적도 조회가 계속 실패했습니다. "
+                    "잠시 후 다시 시도하거나 VWorld API 키/도메인 설정을 확인해 주세요. "
+                    f"마지막 오류: {wfs_error}"
+                ) from wfs_error
 
         for f in part:
             props = f.get("properties", {}) or {}

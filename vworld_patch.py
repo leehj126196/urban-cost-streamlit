@@ -28,22 +28,10 @@ _session.mount("https://", HTTPAdapter(max_retries=_retry))
 
 
 def _normalize_wfs_params(params):
-    """VWorld WFS 1.1.0 EPSG:4326 axis order is lat,lon for BBOX."""
+    """Normalize VWorld WFS responses to JSON without changing caller BBOX."""
     params = dict(params or {})
-    bbox_key = "BBOX" if "BBOX" in params else "bbox" if "bbox" in params else None
-    srs = str(params.get("SRSNAME", params.get("srsname", ""))).upper()
 
-    if bbox_key and srs == "EPSG:4326":
-        try:
-            vals = [float(v) for v in str(params[bbox_key]).split(",")[:4]]
-            if len(vals) == 4:
-                minx, miny, maxx, maxy = vals
-                # VWorld WFS 1.1.0: ymin,xmin,ymax,xmax
-                params[bbox_key] = f"{miny},{minx},{maxy},{maxx}"
-        except Exception:
-            pass
-
-    # VWorld WFS examples use OUTPUT=json for GeoJSON response.
+    # VWorld WFS examples use OUTPUT=json for GeoJSON responses.
     if "OUTPUT" in params:
         params["OUTPUT"] = "json"
     elif "output" in params:
