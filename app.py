@@ -20,6 +20,11 @@ from shapely.geometry import shape
 from shapely.ops import polygonize, unary_union
 from urllib3.util.retry import Retry
 
+try:
+    import pyogrio
+except ImportError:
+    pyogrio = None
+
 st.set_page_config(
     page_title="도시계획시설 개략사업비 산정기",
     page_icon="🛣️",
@@ -89,6 +94,12 @@ VWORLD_LAND_URL = "https://api.vworld.kr/ned/data/ladfrlList"
 VWORLD_CHAR_URL = "https://api.vworld.kr/ned/data/getLandCharacteristics"
 VWORLD_PRICE_URL = "https://api.vworld.kr/ned/data/getIndvdLandPriceAttr"
 BUILDING_HUB_URL = "https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo"
+BASE_DIR = Path(__file__).resolve().parent
+USE_LOCAL_CADASTRAL = True
+LOCAL_CADASTRAL_PATHS = [
+    BASE_DIR / "data" / "cadastral" / "yeoju_1.gpkg",
+    BASE_DIR / "data" / "cadastral" / "yeoju_2.gpkg",
+]
 
 _retry = Retry(
     total=3,
@@ -466,6 +477,117 @@ def vworld_features(data_id, bounds, key, domain):
     return feats, fallback_used
 
 
+def display_path(path):
+    try:
+        return str(path.relative_to(BASE_DIR))
+    except ValueError:
+        return str(path)
+
+
+@st.cache_data(show_spinner=False)
+def gpkg_layer_info(path_str):
+    layers = pyogrio.list_layers(path_str)
+    if len(layers) == 0:
+        raise RuntimeError(f"GeoPackage 레이어가 없습니다: {path_str}")
+
+    layer_name = None
+    for row in layers:
+        name = row[0]
+        geom_type = row[1] if len(row) > 1 else None
+        if geom_type and str(geom_type).lower() not in {"none", "unknown"}:
+            layer_name = name
+            break
+    if layer_name is None:
+        layer_name = layers[0][0]
+
+    info = pyogrio.read_info(path_str, layer=layer_name)
+    crs = info.get("crs")
+    return str(layer_name), str(crs) if crs else None
+
+
+def pnu_column(gdf):
+    for col in gdf.columns:
+        if col.lower() == "pnu":
+            return col
+    for col in gdf.columns:
+        lowered = col.lower()
+        if "pnu" in lowered or col in {"고유번호", "필지고유번호"}:
+            return col
+    return None
+
+
+def read_local_cadastral_candidates(zone):
+    if pyogrio is None:
+        raise RuntimeError("pyogrio 패키지가 설치되어 있지 않습니다. requirements.txt 설치 상태를 확인해 주세요.")
+
+    missing = [display_path(path) for path in LOCAL_CADASTRAL_PATHS if not path.exists()]
+    if missing:
+        raise FileNotFoundError("로컬 연속지적도 파일을 찾지 못했습니다: " + ", ".join(missing))
+
+    frames = []
+    for path in LOCAL_CADASTRAL_PATHS:
+        layer, gpkg_crs = gpkg_layer_info(str(path))
+        zone_for_file = zone.to_crs(gpkg_crs) if gpkg_crs else zone
+        bbox = tuple(float(v) for v in zone_for_file.total_bounds)
+        gdf = pyogrio.read_dataframe(str(path), layer=layer, bbox=bbox)
+        if gdf.empty:
+            continue
+        if gdf.geometry.name != "geometry":
+            gdf = gdf.rename_geometry("geometry")
+        if gdf.crs is None:
+            if gpkg_crs:
+                gdf = gdf.set_crs(gpkg_crs)
+            else:
+                gdf = gdf.set_crs(zone_for_file.crs)
+        gdf["_source_gpkg"] = display_path(path)
+        frames.append(gdf)
+
+    if not frames:
+        return gpd.GeoDataFrame(geometry=[], crs=zone.crs)
+
+    target_crs = frames[0].crs
+    normalized = []
+    for frame in frames:
+        if target_crs and frame.crs and frame.crs != target_crs:
+            frame = frame.to_crs(target_crs)
+        normalized.append(frame)
+
+    combined = pd.concat(normalized, ignore_index=True)
+    return gpd.GeoDataFrame(combined, geometry="geometry", crs=target_crs)
+
+
+def local_cadastral_intersections(zone):
+    cad = read_local_cadastral_candidates(zone)
+    if cad.empty:
+        return gpd.GeoDataFrame(columns=["PNU", "pnu", "편입면적(㎡)", "geometry"], geometry="geometry", crs=5179)
+
+    pc = pnu_column(cad)
+    if not pc:
+        raise RuntimeError("로컬 연속지적도 PNU 필드를 찾지 못했습니다.")
+
+    if cad.crs is None:
+        raise RuntimeError("로컬 연속지적도 CRS를 확인할 수 없습니다.")
+
+    zone_for_cad = zone.to_crs(cad.crs)
+    zone_geom = zone_for_cad.geometry.iloc[0]
+    cad = cad[cad.geometry.notna() & ~cad.geometry.is_empty].copy()
+    cad["pnu"] = cad[pc].astype(str)
+    cad = cad[cad.geometry.intersects(zone_geom)].copy()
+    if cad.empty:
+        return gpd.GeoDataFrame(columns=["PNU", "pnu", "편입면적(㎡)", "geometry"], geometry="geometry", crs=5179)
+
+    intersections = gpd.GeoSeries(cad.geometry.intersection(zone_geom), crs=cad.crs)
+    cad["편입면적(㎡)"] = intersections.to_crs(5179).area.values
+    cad = cad[cad["편입면적(㎡)"] > 0.01].copy()
+    if cad.empty:
+        return gpd.GeoDataFrame(columns=["PNU", "pnu", "편입면적(㎡)", "geometry"], geometry="geometry", crs=5179)
+
+    cad["PNU"] = cad["pnu"]
+    cm = cad[["PNU", "pnu", "편입면적(㎡)", "geometry"]].to_crs(5179)
+    cm = cm.dissolve(by="PNU", aggfunc={"pnu": "first", "편입면적(㎡)": "sum"}).reset_index()
+    return cm
+
+
 def clean_diagnostic_text(text, key):
     text = clean_api_text(text)
     if key:
@@ -815,33 +937,36 @@ if st.button(
 ):
     try:
         with st.spinner("연속지적도와 구역계를 교차하고 있습니다..."):
-            features, used_wfs = vworld_features(
-                "LP_PA_CBND_BUBUN",
-                tuple(zone.total_bounds),
-                vworld_key,
-                vworld_domain,
-            )
-            cad = features_gdf(features)
+            if USE_LOCAL_CADASTRAL:
+                cm = local_cadastral_intersections(zone)
+            else:
+                features, used_wfs = vworld_features(
+                    "LP_PA_CBND_BUBUN",
+                    tuple(zone.total_bounds),
+                    vworld_key,
+                    vworld_domain,
+                )
+                cad = features_gdf(features)
 
-        if used_wfs:
-            st.info("VWorld 2D 데이터 API 응답이 불안정하여 WFS 방식으로 자동 전환했습니다.")
+                if used_wfs:
+                    st.info("VWorld 2D 데이터 API 응답이 불안정하여 WFS 방식으로 자동 전환했습니다.")
 
-        if cad.empty:
-            raise RuntimeError("연속지적도를 찾지 못했습니다.")
+                if cad.empty:
+                    raise RuntimeError("연속지적도를 찾지 못했습니다.")
 
-        if "pnu" not in cad.columns:
-            pc = next((c for c in cad.columns if c.lower() == "pnu"), None)
-            if not pc:
-                raise RuntimeError("연속지적도 PNU 필드를 찾지 못했습니다.")
-            cad["pnu"] = cad[pc]
+                if "pnu" not in cad.columns:
+                    pc = next((c for c in cad.columns if c.lower() == "pnu"), None)
+                    if not pc:
+                        raise RuntimeError("연속지적도 PNU 필드를 찾지 못했습니다.")
+                    cad["pnu"] = cad[pc]
 
-        zm = zone.to_crs(5179).geometry.iloc[0]
-        cm = cad.to_crs(5179)
-        cm = cm[cm.geometry.intersects(zm)].copy()
-        cm["편입면적(㎡)"] = cm.geometry.intersection(zm).area
-        cm = cm[cm["편입면적(㎡)"] > 0.01].copy()
-        cm["PNU"] = cm["pnu"].astype(str)
-        cm = cm.drop_duplicates("PNU")
+                zm = zone.to_crs(5179).geometry.iloc[0]
+                cm = cad.to_crs(5179)
+                cm = cm[cm.geometry.intersects(zm)].copy()
+                cm["편입면적(㎡)"] = cm.geometry.intersection(zm).area
+                cm = cm[cm["편입면적(㎡)"] > 0.01].copy()
+                cm["PNU"] = cm["pnu"].astype(str)
+                cm = cm.drop_duplicates("PNU")
 
         if cm.empty:
             raise RuntimeError("구역계와 교차하는 필지를 찾지 못했습니다.")
