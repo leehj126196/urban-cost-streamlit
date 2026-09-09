@@ -648,10 +648,12 @@ bld_key = st.secrets.get("BUILDING_HUB_API_KEY", "")
 
 with st.sidebar:
     st.subheader("📐 원본 좌표계")
-    epsg = st.text_input(
-        "DXF/SHP 원본 EPSG 번호",
-        value="5179",
-        help="QGIS에서 확인한 EPSG 번호를 입력하세요. 예: 5174, 5179, 5186",
+    epsg = st.selectbox(
+        "DXF/SHP 원본 좌표계",
+        options=["5174", "5186"],
+        index=0,
+        format_func=lambda x: f"EPSG:{x}",
+        help="DXF처럼 좌표계 정보가 없는 파일은 원본 좌표계를 선택하세요.",
     )
     st.caption("SHP에 .prj가 있거나 GPKG에 CRS가 있으면 파일 CRS가 우선합니다.")
     st.divider()
