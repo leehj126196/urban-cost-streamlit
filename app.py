@@ -94,12 +94,17 @@ VWORLD_LAND_URL = "https://api.vworld.kr/ned/data/ladfrlList"
 VWORLD_CHAR_URL = "https://api.vworld.kr/ned/data/getLandCharacteristics"
 VWORLD_PRICE_URL = "https://api.vworld.kr/ned/data/getIndvdLandPriceAttr"
 BUILDING_HUB_URL = "https://apis.data.go.kr/1613000/BldRgstHubService/getBrTitleInfo"
+LEGAL_DONG_URL = "https://apis.data.go.kr/1741000/StanReginCd/getStanReginCdList"
+GG_JIGA_URL = "https://openapi.gg.go.kr/TBGRISANVMJIGAM"
 BASE_DIR = Path(__file__).resolve().parent
 USE_LOCAL_CADASTRAL = True
 LOCAL_CADASTRAL_PATHS = [
     BASE_DIR / "data" / "cadastral" / "yeoju_1.gpkg",
     BASE_DIR / "data" / "cadastral" / "yeoju_2.gpkg",
 ]
+GG_LEGAL_DONG_NAME_OVERRIDES = {
+    "4167010900": "여주시 월송동",
+}
 
 _retry = Retry(
     total=3,
@@ -687,7 +692,217 @@ def ned(url, pnu, key, domain, year=None):
     return safe_json_get(url, params)
 
 
-def parcel_info(pnu, key, domain):
+def clean_secret_text(text, *secrets):
+    text = clean_api_text(text)
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "***")
+    return text
+
+
+def parse_pnu(pnu):
+    pnu = re.sub(r"\D", "", str(pnu or ""))
+    if len(pnu) != 19:
+        raise ValueError(f"PNU는 19자리여야 합니다. 현재 값: {pnu or '(없음)'}")
+
+    land_flag = pnu[10]
+    if land_flag not in {"1", "2"}:
+        raise ValueError(f"PNU 산여부 값은 1 또는 2여야 합니다. 현재 값: {land_flag}")
+
+    bun = int(pnu[11:15])
+    bu = int(pnu[15:19])
+    return {
+        "pnu": pnu,
+        "legal_dong_code": pnu[:10],
+        "land_flag": land_flag,
+        "is_mountain": land_flag == "2",
+        "bun": bun,
+        "bu": bu,
+        "jibun": f"{'산 ' if land_flag == '2' else ''}{bun}" + (f"-{bu}" if bu else ""),
+    }
+
+
+def response_json(url, params, *secret_values, timeout=20):
+    try:
+        response = _http.get(url, params=params, timeout=timeout)
+    except requests.RequestException as e:
+        raise RuntimeError(f"requests 오류: {clean_secret_text(repr(e), *secret_values)}") from e
+
+    body = clean_secret_text(response.text, *secret_values)
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {body}")
+
+    try:
+        return json_from_response(response)
+    except Exception as e:
+        raise RuntimeError(
+            f"JSON 해석 실패: {clean_secret_text(repr(e), *secret_values)} / 응답: {body}"
+        ) from e
+
+
+def row_value(row, keys, default=""):
+    for key in keys:
+        if isinstance(row, dict) and row.get(key) not in (None, "", "null"):
+            return row[key]
+    return default
+
+
+@st.cache_data(show_spinner=False)
+def legal_dong_rows(legal_key):
+    data = response_json(
+        LEGAL_DONG_URL,
+        {
+            "ServiceKey": legal_key,
+            "pageNo": "1",
+            "numOfRows": "1000",
+            "type": "json",
+            "flag": "Y",
+            "locatadd_nm": "경기도 여주시",
+        },
+        legal_key,
+    )
+    return deep_dicts(data, {"locatadd_nm", "region_cd"})
+
+
+def legal_dong_name_from_code(legal_dong_code, legal_key):
+    if not legal_key:
+        raise RuntimeError("LEGAL_DONG_API_KEY가 설정되어 있지 않습니다.")
+
+    for row in legal_dong_rows(legal_key):
+        code = str(row_value(row, ["region_cd", "locatjumin_cd", "locatjijuk_cd"], "")).strip()
+        name = str(row_value(row, ["locatadd_nm"], "")).strip()
+        exists = str(row_value(row, ["exist_at", "exist_yn"], "Y")).strip()
+        if code == legal_dong_code and exists not in {"폐지", "N"} and name:
+            return name
+
+    raise RuntimeError(f"법정동코드 {legal_dong_code}의 법정동명을 찾지 못했습니다.")
+
+
+def normalize_gg_legal_dong_name(name):
+    return re.sub(r"^경기도\s+", "", str(name or "").strip())
+
+
+def legal_dong_name_map(legal_key):
+    names = dict(GG_LEGAL_DONG_NAME_OVERRIDES)
+    if not legal_key:
+        return names
+
+    for row in legal_dong_rows(legal_key):
+        code = str(row_value(row, ["region_cd", "locatjumin_cd", "locatjijuk_cd"], "")).strip()
+        name = str(row_value(row, ["locatadd_nm"], "")).strip()
+        exists = str(row_value(row, ["exist_at", "exist_yn"], "Y")).strip()
+        if code and name and exists not in {"폐지", "N"}:
+            names[code] = normalize_gg_legal_dong_name(name)
+    return names
+
+
+def gg_legal_dong_name_from_code(legal_dong_code, legal_lookup):
+    if isinstance(legal_lookup, dict):
+        name = legal_lookup.get(legal_dong_code, "")
+        if name:
+            return name
+        raise RuntimeError(f"법정동코드 {legal_dong_code}의 법정동명을 찾지 못했습니다.")
+
+    if legal_dong_code in GG_LEGAL_DONG_NAME_OVERRIDES:
+        return GG_LEGAL_DONG_NAME_OVERRIDES[legal_dong_code]
+    return normalize_gg_legal_dong_name(
+        legal_dong_name_from_code(legal_dong_code, legal_lookup)
+    )
+
+
+def gg_jibun_nm_from_pnu(pnu, legal_lookup):
+    parsed = parse_pnu(pnu)
+    legal_name = gg_legal_dong_name_from_code(parsed["legal_dong_code"], legal_lookup)
+    return f"{legal_name} {parsed['jibun']}"
+
+
+def verify_pnu_parser():
+    parsed = parse_pnu("4167010900101870000")
+    expected = {
+        "legal_dong_code": "4167010900",
+        "land_flag": "1",
+        "bun": 187,
+        "bu": 0,
+        "jibun": "187",
+    }
+    for key, value in expected.items():
+        if parsed[key] != value:
+            raise RuntimeError(f"PNU 파싱 검증 실패: {key}={parsed[key]}")
+    jibun_nm = f"{GG_LEGAL_DONG_NAME_OVERRIDES[parsed['legal_dong_code']]} {parsed['jibun']}"
+    if jibun_nm != "여주시 월송동 187":
+        raise RuntimeError(f"PNU 지번 변환 검증 실패: {jibun_nm}")
+
+
+verify_pnu_parser()
+
+
+def gg_jiga_rows(gg_key, jibun_nm):
+    data = response_json(
+        GG_JIGA_URL,
+        {
+            "KEY": gg_key,
+            "Type": "json",
+            "pIndex": "1",
+            "pSize": "1000",
+            "JIBUN_NM": jibun_nm,
+        },
+        gg_key,
+        timeout=10,
+    )
+    require_gg_success(data)
+    return deep_dicts(data, {"LAND_CD", "JIBUN_NM", "JIGA"})
+
+
+def gg_result_info(data):
+    code = ""
+    message = ""
+
+    def walk(obj):
+        nonlocal code, message
+        if code:
+            return
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if key.upper() == "RESULT" and isinstance(value, dict):
+                    code = str(row_value(value, ["CODE", "code"], "")).strip()
+                    message = str(row_value(value, ["MESSAGE", "message"], "")).strip()
+                    return
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                walk(value)
+
+    walk(data)
+    return code, message
+
+
+def require_gg_success(data):
+    code, message = gg_result_info(data)
+    if code != "INFO-000":
+        detail = f"RESULT.CODE={code or '(없음)'}"
+        if message:
+            detail += f" / {message}"
+        raise RuntimeError(f"경기데이터드림 응답이 정상 코드가 아닙니다. {detail}")
+
+
+def latest_gg_jiga_row(rows, pnu):
+    matched = [
+        row for row in rows
+        if str(row_value(row, ["LAND_CD"], "")).strip() == str(pnu)
+    ]
+    if not matched:
+        return None
+
+    def sort_key(row):
+        year = fnum(row_value(row, ["YEAR"], 0))
+        month = fnum(row_value(row, ["BASE_MON"], 0))
+        return year, month
+
+    return sorted(matched, key=sort_key, reverse=True)[0]
+
+
+def vworld_parcel_info(pnu, key, domain):
     land, char, price = {}, {}, {}
 
     try:
@@ -752,6 +967,52 @@ def parcel_info(pnu, key, domain):
         "용도지역": zoning,
         "공시지가(원/㎡)": fnum(first(price, ["pblntfPclnd"], 0)),
         "공시지가연도": first(price, ["stdrYear"], ""),
+        "배율구분": cat,
+        "보상배율": mult,
+    }
+
+
+def compensation_category(landcat, usage):
+    text = f"{usage} {landcat}"
+    if any(k in text for k in ["주거","공업","공장"]):
+        return "주거용·공업용"
+    if any(k in text for k in ["상업","주차"]):
+        return "상업용·주차용"
+    if any(k in text for k in ["전","답","과수"]):
+        return "전·답·과"
+    if any(k in text for k in ["임야","산림"]):
+        return "임야"
+    return "공공·기타"
+
+
+def compensation_multiplier(pnu, cat):
+    sido = SIDO_FROM_PNU.get(str(pnu)[:2], "")
+    mult = MULT.get(sido, {}).get(cat)
+    if mult is None:
+        mult = MULT.get(sido, {}).get("전체", 1.0)
+    return sido, mult
+
+
+def parcel_info(pnu, gg_key, legal_lookup):
+    parsed = parse_pnu(pnu)
+    jibun_nm = gg_jibun_nm_from_pnu(parsed["pnu"], legal_lookup)
+    row = latest_gg_jiga_row(gg_jiga_rows(gg_key, jibun_nm), parsed["pnu"])
+    if not row:
+        raise RuntimeError(f"LAND_CD가 원래 PNU와 정확히 일치하는 행을 찾지 못했습니다. JIBUN_NM={jibun_nm}")
+
+    landcat = row_value(row, ["JIMOK"])
+    usage = row_value(row, ["LAND_USE"])
+    cat = compensation_category(landcat, usage)
+    sido, mult = compensation_multiplier(parsed["pnu"], cat)
+
+    return {
+        "PNU": parsed["pnu"],
+        "시도": sido,
+        "지목": landcat,
+        "이용상황": usage,
+        "용도지역": "",
+        "공시지가(원/㎡)": fnum(row_value(row, ["JIGA"], 0)),
+        "공시지가연도": row_value(row, ["YEAR"]),
         "배율구분": cat,
         "보상배율": mult,
     }
@@ -852,6 +1113,8 @@ def excel_bytes(summary, land, bld):
 vworld_key = st.secrets.get("VWORLD_API_KEY", "")
 vworld_domain = st.secrets.get("VWORLD_DOMAIN", "")
 bld_key = st.secrets.get("BUILDING_HUB_API_KEY", "")
+legal_key = st.secrets.get("LEGAL_DONG_API_KEY", "")
+gg_key = st.secrets.get("GG_OPENAPI_KEY", "")
 
 with st.sidebar:
     st.subheader("📐 원본 좌표계")
@@ -867,14 +1130,6 @@ with st.sidebar:
     st.subheader("🔑 API 상태")
     st.write(f"VWorld: {'✅' if vworld_key else '❌'}")
     st.write(f"건축HUB: {'✅' if bld_key else '❌'}")
-    if st.button("VWorld 연결 테스트", use_container_width=True, disabled=not vworld_key):
-        with st.spinner("VWorld 연결을 확인하고 있습니다..."):
-            checks = vworld_healthcheck(vworld_key, vworld_domain)
-        for label, ok, message in checks:
-            if ok:
-                st.success(f"{label}: {message}")
-            else:
-                st.error(f"{label}: {message}")
 
 st.subheader("① 구역계 및 시설종류")
 c1, c2, c3 = st.columns([2.2, 1, 1])
@@ -926,14 +1181,16 @@ if uploaded:
         st.error(f"구역계 읽기 실패: {e}")
         zone = None
 
-if not vworld_key:
+if not gg_key:
+    st.warning("Streamlit Secrets에 GG_OPENAPI_KEY를 등록해 주세요.")
+if not vworld_key and not USE_LOCAL_CADASTRAL:
     st.warning("Streamlit Secrets에 VWORLD_API_KEY를 등록해 주세요.")
 
 if st.button(
     "🧮 개략사업비 산정",
     type="primary",
     use_container_width=True,
-    disabled=(zone is None or not vworld_key),
+    disabled=(zone is None or not gg_key or (not USE_LOCAL_CADASTRAL and not vworld_key)),
 ):
     try:
         with st.spinner("연속지적도와 구역계를 교차하고 있습니다..."):
@@ -974,10 +1231,14 @@ if st.button(
         basics = cm[["PNU","편입면적(㎡)"]].to_dict("records")
         rows = []
         prog = st.progress(0, text="필지별 공시지가 조회 중")
+        try:
+            legal_names = legal_dong_name_map(legal_key)
+        except Exception:
+            legal_names = dict(GG_LEGAL_DONG_NAME_OVERRIDES)
 
         with ThreadPoolExecutor(max_workers=5) as ex:
             futs = {
-                ex.submit(parcel_info, r["PNU"], vworld_key, vworld_domain): r
+                ex.submit(parcel_info, r["PNU"], gg_key, legal_names): r
                 for r in basics
             }
             for i, fut in enumerate(as_completed(futs), 1):
