@@ -113,9 +113,9 @@ class VWorldError(RuntimeError):
         self.transient = transient
 
 
-def clean_api_text(text, limit=260):
+def clean_api_text(text, limit=360):
     text = re.sub(r"\s+", " ", str(text or "")).strip()
-    text = re.sub(r"(?i)(key|serviceKey)=([^&\s]+)", r"\1=***", text)
+    text = re.sub(r"(?i)(key|apiKey|serviceKey)=([^&\s]+)", r"\1=***", text)
     if len(text) > limit:
         return text[:limit].rstrip() + "..."
     return text
@@ -207,8 +207,13 @@ def vworld_json_get(url, params, timeout=45):
     try:
         resp = _http.get(url, params=params, timeout=timeout)
     except requests.RequestException as e:
+        detail = clean_api_text(str(e))
+        suffix = f" 세부 오류: {detail}" if detail else ""
         raise VWorldError(
-            "VWorld 서버에 연결하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+            "VWorld 서버에 연결하지 못했습니다. "
+            "앱 실행 환경의 네트워크, DNS, 방화벽 또는 프록시 설정을 확인해 주세요."
+            f"{suffix}",
+            detail=detail,
             transient=True,
         ) from e
 
@@ -461,6 +466,86 @@ def vworld_features(data_id, bounds, key, domain):
     return feats, fallback_used
 
 
+def clean_diagnostic_text(text, key):
+    text = clean_api_text(text)
+    if key:
+        text = text.replace(str(key), "***")
+    return text
+
+
+def diagnostic_feature_count(data):
+    if isinstance(data, dict) and isinstance(data.get("features"), list):
+        return len(data["features"])
+    rsp = data.get("response", {}) if isinstance(data, dict) else {}
+    features = rsp.get("result", {}).get("featureCollection", {}).get("features", [])
+    return len(features) if isinstance(features, list) else 0
+
+
+def run_vworld_diagnostic(label, url, params, key):
+    try:
+        response = _http.get(url, params=params, timeout=20)
+    except requests.RequestException as e:
+        return label, False, f"requests 오류: {clean_diagnostic_text(repr(e), key)}"
+
+    body = clean_diagnostic_text(response.text, key)
+    if response.status_code >= 400:
+        return label, False, f"HTTP {response.status_code}: {body}"
+
+    try:
+        data = json_from_response(response)
+    except Exception as e:
+        return label, False, (
+            f"HTTP {response.status_code}, JSON 해석 실패: "
+            f"{clean_diagnostic_text(repr(e), key)} / 응답: {body}"
+        )
+
+    code, text = vworld_response_error(data)
+    if code or text:
+        return label, False, (
+            f"HTTP {response.status_code}, VWorld 오류: "
+            f"{clean_diagnostic_text(' '.join(x for x in [code, text] if x), key)}"
+        )
+
+    return label, True, f"HTTP {response.status_code}, {diagnostic_feature_count(data):,}건 응답"
+
+
+def vworld_healthcheck(key, domain):
+    data_params = {
+        "service": "data",
+        "version": "2.0",
+        "request": "GetFeature",
+        "format": "json",
+        "errorformat": "json",
+        "size": "1",
+        "page": "1",
+        "geometry": "false",
+        "attribute": "true",
+        "crs": "EPSG:4326",
+        "data": "LP_PA_CBND_BUBUN",
+        "geomFilter": "BOX(126.977,37.565,126.979,37.567)",
+        "key": key,
+    }
+    wfs_params = {
+        "SERVICE": "WFS",
+        "VERSION": "1.1.0",
+        "REQUEST": "GetFeature",
+        "TYPENAME": "lp_pa_cbnd_bubun",
+        "SRSNAME": "EPSG:4326",
+        "BBOX": "126.977,37.565,126.979,37.567",
+        "MAXFEATURES": "1",
+        "OUTPUT": "json",
+        "KEY": key,
+    }
+    if domain:
+        data_params["domain"] = domain
+        wfs_params["DOMAIN"] = domain
+
+    return [
+        run_vworld_diagnostic("VWorld 2D Data API", VWORLD_DATA_URL, data_params, key),
+        run_vworld_diagnostic("VWorld WFS API", VWORLD_WFS_URL, wfs_params, key),
+    ]
+
+
 def features_gdf(features):
     rows, geoms = [], []
     for f in features:
@@ -660,6 +745,14 @@ with st.sidebar:
     st.subheader("🔑 API 상태")
     st.write(f"VWorld: {'✅' if vworld_key else '❌'}")
     st.write(f"건축HUB: {'✅' if bld_key else '❌'}")
+    if st.button("VWorld 연결 테스트", use_container_width=True, disabled=not vworld_key):
+        with st.spinner("VWorld 연결을 확인하고 있습니다..."):
+            checks = vworld_healthcheck(vworld_key, vworld_domain)
+        for label, ok, message in checks:
+            if ok:
+                st.success(f"{label}: {message}")
+            else:
+                st.error(f"{label}: {message}")
 
 st.subheader("① 구역계 및 시설종류")
 c1, c2, c3 = st.columns([2.2, 1, 1])
